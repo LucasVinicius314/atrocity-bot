@@ -1,5 +1,6 @@
 .env
 resources/data.json
+resources/keys.json
 
 *.sln
 

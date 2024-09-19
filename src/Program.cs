@@ -1,19 +1,27 @@
-﻿using System.Text;
-using Discord;
+﻿using Discord;
 using Discord.WebSocket;
 using Newtonsoft.Json;
+using System.Text;
 
 namespace atrocity_bot
 {
   static class Program
   {
+    static double stoppingChance = .05;
+
+    static string chainPath = "../resources/data.json";
+    static string keysPath = "../resources/keys.json";
+
     static Dictionary<string, ChainEntry>? chain;
+    static Dictionary<string, string> keyMap = new Dictionary<string, string>();
 
     static async Task Main()
     {
       var whitelistedUserIds = (Environment.GetEnvironmentVariable("WHITELISTED_USER_IDS") ?? "").Split(",").ToList();
 
       chain = await LoadChain();
+
+      keyMap = await LoadKeyMap() ?? new Dictionary<string, string>();
 
       var client = new DiscordSocketClient(
         new DiscordSocketConfig
@@ -38,6 +46,20 @@ namespace atrocity_bot
           new SlashCommandBuilder()
             .WithName("generate-atrocity")
             .WithDescription("Generate Atrocity")
+            .WithIntegrationTypes(ApplicationIntegrationType.UserInstall)
+            .WithContextTypes(InteractionContextType.PrivateChannel, InteractionContextType.BotDm, InteractionContextType.Guild)
+            .Build(),
+          new SlashCommandBuilder()
+            .WithName("gpt")
+            .WithDescription("Ask GPT")
+            .AddOption(name: "prompt", type: ApplicationCommandOptionType.String, description: "Prompt.")
+            .WithIntegrationTypes(ApplicationIntegrationType.UserInstall)
+            .WithContextTypes(InteractionContextType.PrivateChannel, InteractionContextType.BotDm, InteractionContextType.Guild)
+            .Build(),
+          new SlashCommandBuilder()
+            .WithName("gpt-setup")
+            .WithDescription("GPT Setup")
+            .AddOption(name: "key", type: ApplicationCommandOptionType.String, description: "The openai api key.")
             .WithIntegrationTypes(ApplicationIntegrationType.UserInstall)
             .WithContextTypes(InteractionContextType.PrivateChannel, InteractionContextType.BotDm, InteractionContextType.Guild)
             .Build(),
@@ -71,20 +93,66 @@ namespace atrocity_bot
             await command.RespondAsync(GenerateOutput(chain));
 
             break;
+          case "gpt":
+            var prompt = command.Data.Options.FirstOrDefault(o => o.Type == ApplicationCommandOptionType.String)?.Value as string;
+            if (prompt == null)
+            {
+              await command.RespondAsync("Missing prompt.", ephemeral: true);
+              break;
+            }
+
+            if (!keyMap.ContainsKey(command.User.Id.ToString()))
+            {
+              await command.RespondAsync("Missing gpt-setup.", ephemeral: true);
+              break;
+            }
+
+            await command.RespondAsync("Generating response.");
+
+            var res = await TextCompletion(prompt, keyMap[command.User.Id.ToString()]);
+
+            var embed = new EmbedBuilder()
+                        .WithTitle(prompt)
+                        .WithDescription(res.Content.First().Text)
+                        .WithFooter($"Input: {res.Usage.InputTokens} tokens.\nOutput: {res.Usage.OutputTokens} tokens.\nTotal: {res.Usage.TotalTokens} tokens.")
+                        .Build();
+
+            await command.ModifyOriginalResponseAsync((a) =>
+              {
+                a.Embed = embed;
+                a.Content = "";
+              }
+            );
+
+            break;
+          case "gpt-setup":
+            var key = command.Data.Options.FirstOrDefault(o => o.Type == ApplicationCommandOptionType.String)?.Value as string;
+            if (key == null)
+            {
+              await command.RespondAsync("Missing key.", ephemeral: true);
+              break;
+            }
+
+            keyMap[command.User.Id.ToString()] = key;
+
+            await SaveKeyMap(keyMap);
+
+            await command.RespondAsync("Key set.", ephemeral: true);
+
+            break;
           case "setup":
             var attachment = command.Data.Options.FirstOrDefault(o => o.Type == ApplicationCommandOptionType.Attachment)?.Value as Attachment;
-
             if (attachment != null)
             {
               using (var httpClient = new HttpClient())
               {
-                var fileContent = await httpClient.GetByteArrayAsync(attachment.Url);
+                await command.RespondAsync("Setup running.", ephemeral: true);
 
-                await File.WriteAllBytesAsync("../resources/data.json", fileContent);
+                await SaveChain(await httpClient.GetByteArrayAsync(attachment.Url));
 
                 chain = await LoadChain();
 
-                await command.RespondAsync("Setup done.", ephemeral: true);
+                await command.ModifyOriginalResponseAsync((a) => a.Content = "Setup done.");
               }
             }
 
@@ -105,8 +173,6 @@ namespace atrocity_bot
       var keys = chain.Keys.ToList();
 
       var currentEntry = chain[keys[new Random().Next(keys.Count)]];
-
-      var stoppingChance = .05;
 
       while (true)
       {
@@ -135,17 +201,43 @@ namespace atrocity_bot
       return outValue.Trim();
     }
 
+    static async Task<OpenAI.Chat.ChatCompletion> TextCompletion(string prompt, string apiKey)
+    {
+      return (await new OpenAI.OpenAIClient(apiKey).GetChatClient("gpt-4o").CompleteChatAsync(prompt)).Value;
+    }
+
     static async Task<Dictionary<string, ChainEntry>?> LoadChain()
     {
-      if (!File.Exists("../resources/data.json"))
+      if (!File.Exists(chainPath))
       {
         return null;
       }
 
-      var fileBytes = await File.ReadAllBytesAsync("../resources/data.json");
       return JsonConvert.DeserializeObject<Dictionary<string, ChainEntry>>(
-        Encoding.UTF8.GetString(fileBytes)
+        Encoding.UTF8.GetString(await File.ReadAllBytesAsync(chainPath))
       );
+    }
+
+    static async Task<Dictionary<string, string>?> LoadKeyMap()
+    {
+      if (!File.Exists(keysPath))
+      {
+        return null;
+      }
+
+      return JsonConvert.DeserializeObject<Dictionary<string, string>>(
+        Encoding.UTF8.GetString(await File.ReadAllBytesAsync(keysPath))
+      );
+    }
+
+    static async Task SaveChain(byte[] fileContent)
+    {
+      await File.WriteAllBytesAsync(chainPath, fileContent);
+    }
+
+    static async Task SaveKeyMap(Dictionary<string, string> keyMap)
+    {
+      await File.WriteAllBytesAsync(keysPath, System.Text.Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(keyMap)));
     }
   }
 }
