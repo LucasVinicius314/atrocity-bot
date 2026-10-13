@@ -2,12 +2,14 @@
 using Discord.WebSocket;
 using Newtonsoft.Json;
 using System.Text;
+using Whisper.net.Ggml;
 
 namespace atrocity_bot
 {
   static class Program
   {
     static double stoppingChance = .05;
+    const int maxAudioBytes = 25 * 1024 * 1024;
 
     static string chainPath = "../resources/data.json";
     static string keysPath = "../resources/keys.json";
@@ -17,6 +19,14 @@ namespace atrocity_bot
 
     static async Task Main()
     {
+      var modelName = Environment.GetEnvironmentVariable("WHISPER_MODEL") ?? "Base";
+      if (!Enum.TryParse<GgmlType>(modelName, true, out var modelType))
+      {
+        throw new ArgumentException($"Invalid WHISPER_MODEL '{modelName}'. Valid values: {string.Join(", ", Enum.GetNames<GgmlType>())}.");
+      }
+
+      var transcriber = new Transcriber($"../resources/ggml-{modelType.ToString().ToLowerInvariant()}.bin", modelType);
+
       var whitelistedUserIds = (Environment.GetEnvironmentVariable("WHITELISTED_USER_IDS") ?? "").Split(",").ToList();
 
       chain = await LoadChain();
@@ -42,7 +52,7 @@ namespace atrocity_bot
 
       client.Ready += async () =>
       {
-        await client.BulkOverwriteGlobalApplicationCommandsAsync(new[] {
+        await client.BulkOverwriteGlobalApplicationCommandsAsync(new ApplicationCommandProperties[] {
           new SlashCommandBuilder()
             .WithName("generate-atrocity")
             .WithDescription("Generate Atrocity")
@@ -70,7 +80,66 @@ namespace atrocity_bot
             .WithIntegrationTypes(ApplicationIntegrationType.UserInstall)
             .WithContextTypes(InteractionContextType.PrivateChannel, InteractionContextType.BotDm, InteractionContextType.Guild)
             .Build(),
+          new MessageCommandBuilder()
+            .WithName("transcribe")
+            .WithIntegrationTypes(ApplicationIntegrationType.UserInstall)
+            .WithContextTypes(InteractionContextType.PrivateChannel, InteractionContextType.BotDm, InteractionContextType.Guild)
+            .Build(),
         });
+      };
+
+      client.MessageCommandExecuted += async (command) =>
+      {
+        if (!whitelistedUserIds.Contains(command.User.Id.ToString()))
+        {
+          await command.RespondAsync("Not authorized.", ephemeral: true);
+          return;
+        }
+
+        if (command.CommandName != "transcribe")
+        {
+          await command.RespondAsync("Invalid command.", ephemeral: true);
+          return;
+        }
+
+        var audio = command.Data.Message.Attachments.FirstOrDefault(IsAudio);
+        if (audio == null)
+        {
+          await command.RespondAsync("That message has no audio attachment.", ephemeral: true);
+          return;
+        }
+
+        if (audio.Size > maxAudioBytes)
+        {
+          await command.RespondAsync($"Audio is too large (max {maxAudioBytes / 1024 / 1024} MB).", ephemeral: true);
+          return;
+        }
+
+        // Transcribing can take longer than the 3 second interaction deadline.
+        await command.DeferAsync();
+
+        try
+        {
+          using var httpClient = new HttpClient();
+          var text = await transcriber.TranscribeAsync(await httpClient.GetByteArrayAsync(audio.Url));
+
+          // Posting as the interaction response keeps the transcript attached to the marked message
+          // (Discord shows it as a reply to the command target) and works in user-install contexts.
+          var chunks = ChunkText(text.Length == 0 ? "*(no speech detected)*" : text, 2000);
+
+          await command.ModifyOriginalResponseAsync((a) => a.Content = chunks[0]);
+
+          foreach (var chunk in chunks.Skip(1))
+          {
+            await command.FollowupAsync(chunk);
+          }
+        }
+        catch (Exception e)
+        {
+          Console.WriteLine(e);
+
+          await command.ModifyOriginalResponseAsync((a) => a.Content = "Transcription failed.");
+        }
       };
 
       client.SlashCommandExecuted += async (command) =>
@@ -166,6 +235,25 @@ namespace atrocity_bot
       await Task.Delay(-1);
     }
 
+    static bool IsAudio(IAttachment attachment)
+    {
+      return attachment.ContentType?.StartsWith("audio/") == true
+        || attachment.ContentType?.StartsWith("video/") == true
+        || attachment.Waveform != null;
+    }
+
+    static List<string> ChunkText(string text, int size)
+    {
+      var chunks = new List<string>();
+
+      for (var i = 0; i < text.Length; i += size)
+      {
+        chunks.Add(text.Substring(i, Math.Min(size, text.Length - i)));
+      }
+
+      return chunks;
+    }
+
     static string GenerateOutput(Dictionary<string, ChainEntry> chain)
     {
       var outValue = "";
@@ -184,8 +272,7 @@ namespace atrocity_bot
           break;
         }
 
-        var nextEntry = chain[nextToken];
-        if (nextEntry == null)
+        if (!chain.TryGetValue(nextToken, out var nextEntry))
         {
           break;
         }
